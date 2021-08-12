@@ -55,13 +55,16 @@ module ScottBarron                   #:nodoc:
           def perform(record)
             return false unless guard(record)
             loopback = record.current_state.to_s == to
-            states = record.class.read_inheritable_attribute(:states)
+            states = record._states
             next_state = states[to]
             old_state = states[record.current_state.to_s]
 
-            next_state.entering(record) unless loopback
-
-            record.update_attribute(record.class.state_column, next_state.value)
+            # у нас создаются джобы при изменении статуса и важно, чтобы джоба
+            # не начала выполняться раньше изменения статуса
+            ActiveRecord::Base.transaction do
+              next_state.entering(record) unless loopback
+              record.update_attribute(record.class.state_column, next_state.value)
+            end
 
             next_state.entered(record) unless loopback
             old_state.exited(record) unless loopback
@@ -94,8 +97,9 @@ module ScottBarron                   #:nodoc:
 
           def fire(record)
             next_states(record).each do |transition|
-              break true if transition.perform(record)
+              return true if transition.perform(record)
             end
+            false
           end
 
           def transitions(trans_opts)
@@ -118,16 +122,17 @@ module ScottBarron                   #:nodoc:
 
             raise NoInitialState unless options[:initial]
 
-            write_inheritable_attribute :states, {}
-            write_inheritable_attribute :initial_state, options[:initial]
-            write_inheritable_attribute :transition_table, {}
-            write_inheritable_attribute :event_table, {}
-            write_inheritable_attribute :state_column, options[:column] || 'state'
+            class_attribute    :initial_state
+            class_attribute    :state_column
+            class_attribute    :transition_table
+            class_attribute    :event_table
 
-            class_inheritable_reader    :initial_state
-            class_inheritable_reader    :state_column
-            class_inheritable_reader    :transition_table
-            class_inheritable_reader    :event_table
+            class_attribute :_states
+            self._states = {}
+            self.initial_state = options[:initial]
+            self.transition_table = {}
+            self.event_table = {}
+            self.state_column = options[:column] || 'state'
 
             before_create               :set_initial_state
             after_create                :run_initial_state_actions
@@ -137,11 +142,11 @@ module ScottBarron                   #:nodoc:
 
       module InstanceMethods
         def set_initial_state #:nodoc:
-          write_attribute self.class.state_column, self.class.initial_state.to_s
+          write_attribute self.class.state_column, self.class.initial_state.to_s if read_attribute(self.class.state_column).blank?
         end
 
         def run_initial_state_actions
-          initial = self.class.read_inheritable_attribute(:states)[self.class.initial_state.to_s]
+          initial = _states[self.class.initial_state.to_s]
           initial.entering(self)
           initial.entered(self)
         end
@@ -158,7 +163,7 @@ module ScottBarron                   #:nodoc:
         end
 
         def next_states_for_event(event)
-          self.class.read_inheritable_attribute(:transition_table)[event.to_sym].select do |s|
+          self.class.transition_table[event.to_sym].select do |s|
             s.from == current_state.to_s
           end
         end
@@ -171,8 +176,9 @@ module ScottBarron                   #:nodoc:
 
       module ClassMethods
         # Returns an array of all known states.
+
         def states
-          read_inheritable_attribute(:states).keys.collect { |state| state.to_sym }
+          _states.keys.collect { |state| state.to_sym }
         end
 
         # Define an event.  This takes a block which describes all valid transitions
@@ -199,10 +205,10 @@ module ScottBarron                   #:nodoc:
         # created is the name of the event followed by an exclamation point (!).
         # Example: <tt>order.close_order!</tt>.
         def event(event, opts={}, &block)
-          tt = read_inheritable_attribute(:transition_table)
+          tt = self.transition_table
 
           e = SupportingClasses::Event.new(event, opts, tt, &block)
-          write_inheritable_hash(:event_table, event.to_sym => e)
+          self.event_table = {event.to_sym => e}
           define_method("#{event.to_s}!") { e.fire(self) }
         end
 
@@ -220,7 +226,7 @@ module ScottBarron                   #:nodoc:
         # end
         def state(name, opts={})
           state = SupportingClasses::State.new(name, opts)
-          write_inheritable_hash(:states, state.value => state)
+          self._states.merge!(state.value => state)
 
           define_method("#{state.name}?") { current_state.to_s == state.value }
         end
